@@ -10,7 +10,9 @@ model it as an ontology, and build analytics and apps on top — end to end.
 > [MINI_FOUNDRY_ARCHITECTURE_REVIEW_CHECKLIST.md](MINI_FOUNDRY_ARCHITECTURE_REVIEW_CHECKLIST.md)
 > for the honest gap analysis.
 
-Interested in contributing? See [README_CONTRIBUTION.md](README_CONTRIBUTION.md).
+Screenshots and diagrams are available in [images/](images/).
+
+![Mini Foundry architecture](images/architecture.png)
 
 ---
 
