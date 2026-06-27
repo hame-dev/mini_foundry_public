@@ -1,0 +1,205 @@
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://mini:mini@postgres:5432/mini_foundry
+  SYNC_DATABASE_URL: postgresql://mini:mini@postgres:5432/mini_foundry
+  REDIS_URL: redis://redis:6379/0
+  OLLAMA_BASE_URL: http://ollama:11434
+  OLLAMA_DEFAULT_MODEL: ${OLLAMA_DEFAULT_MODEL:-qwen3.5:4b}
+  JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+  # Symmetric key used by app.permissions.secrets (Fernet) to encrypt connector
+  # passwords. CHANGE THIS IN PROD — rotating it makes existing ciphertexts
+  # un-decryptable.
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-secret-key-change-me-in-prod-32chars}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@mini.local}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+  # First-boot demo seed (e-commerce dataset + ontology + sample pipeline).
+  # Idempotent: re-running the backend won't duplicate. Set to "false" to
+  # skip seeding entirely (e.g. in production).
+  SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+  FRONTEND_ORIGIN: http://localhost:${FRONTEND_PORT:-3000}
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: minioadmin
+  S3_SECRET_KEY: minioadmin
+  S3_BUCKET: mini-foundry
+  SANDBOX_IMAGE: mini-foundry-sandbox:0.5
+  SANDBOX_WORK_ROOT: /tmp/mfsbx
+  SANDBOX_DOCKER_MOUNT_ROOT: ${SANDBOX_DOCKER_MOUNT_ROOT:-${PWD}/.sandbox_workspaces}
+  TRINO_HOST: trino
+  TRINO_PORT: 8080
+  TRINO_USER: mini-foundry
+  TRINO_CATALOG: postgres
+  TRINO_SCHEMA: public
+  SPARK_RUNNER_TYPE: trino
+  SPARK_CONNECT_URL: sc://spark:15002
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mini
+      POSTGRES_PASSWORD: mini
+      POSTGRES_DB: mini_foundry
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mini -d mini_foundry"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+  ollama:
+    image: ollama/ollama
+    profiles: ["ai"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  ollama-init:
+    image: ollama/ollama
+    profiles: ["ai"]
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: >
+      /bin/sh -c "
+      until ollama list >/dev/null 2>&1; do sleep 2; done &&
+      ollama list | awk 'NR > 1 {print $$1}' | grep -qx '${OLLAMA_DEFAULT_MODEL:-qwen3.5:4b}' ||
+      ollama pull ${OLLAMA_DEFAULT_MODEL:-qwen3.5:4b}
+      "
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3 &&
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb -p local/mini-foundry || true &&
+      exit 0
+      "
+
+  sandbox-image:
+    build:
+      context: ./backend/docker/sandbox
+    image: mini-foundry-sandbox:0.5
+    pull_policy: build
+    command: ["python", "-c", "print('mini-foundry sandbox image ready')"]
+
+  migrate:
+    build: ./backend
+    command: alembic upgrade head
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+
+  worker:
+    build: ./backend
+    command: celery -A app.jobs.celery_app.celery_app worker --loglevel=info --concurrency=2
+    environment: *backend-env
+    volumes:
+      # Mount the host docker socket so the worker can spawn sandbox
+      # containers. The sandbox containers themselves run --network=none and
+      # do NOT get the socket. See plan v0.5 sandbox notes.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.sandbox_workspaces:/tmp/mfsbx
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      sandbox-image:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+
+  beat:
+    build: ./backend
+    command: sh -c "python -m app.jobs.beat_loader && celery -A app.jobs.celery_app.celery_app beat --loglevel=info"
+    environment: *backend-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  frontend:
+    build: ./frontend
+    command: npm run dev -- --hostname 0.0.0.0
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000/api/v1
+    depends_on:
+      backend:
+        condition: service_started
+
+  trino:
+    image: trinodb/trino:435
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./docker/trino/catalog:/etc/trino/catalog
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # spark:
+  #   image: apache/spark:3.5.1
+  #   ports:
+  #     - "15002:15002"
+  #     - "4040:4040"
+  #   command: >
+  #     /opt/spark/sbin/start-connect-server.sh
+  #     --packages org.apache.spark:spark-connect_2.12:3.5.1,org.postgresql:postgresql:42.7.2
+  #     --conf spark.driver.bindAddress=0.0.0.0
+
+
+
+volumes:
+  pgdata:
+  redisdata:
+  ollama:
+  minio_data:

@@ -1,0 +1,54 @@
+# Hardened sandbox isolation overlay.
+#
+# Goal: the Celery worker must NOT have access to the host Docker daemon. A
+# worker compromise with the host socket mounted is equivalent to host root.
+# This overlay runs a dedicated, rootless Docker daemon in a side container and
+# points the worker at it via DOCKER_HOST, so sandbox containers are spawned on
+# an isolated daemon (optionally with the gVisor `runsc` runtime).
+#
+# Usage:
+#   1. Remove the host socket mount from the `worker` service in
+#      docker-compose.yml (the line `- /var/run/docker.sock:/var/run/docker.sock`).
+#      Compose cannot unmount a volume via an overlay, so this one base edit is
+#      required for a true host-isolation boundary.
+#   2. docker compose -f docker-compose.yml -f docker-compose.hardened.yml up
+#
+# Verify the worker has no host socket:
+#   docker compose -f docker-compose.yml -f docker-compose.hardened.yml config | \
+#     grep -A40 'worker:' | grep docker.sock   # -> no output
+#
+# For production-grade isolation prefer gVisor/Kata or a Kubernetes Job with a
+# restricted RuntimeClass; this overlay is the self-hosted reference setup.
+
+services:
+  # Dedicated rootless Docker daemon. Runs in its own user namespace; a breakout
+  # from a sandbox container lands here, not on the host. Exposes a plain TCP
+  # endpoint on the internal compose network only (never publish this port).
+  docker-rootless:
+    image: docker:25-dind-rootless
+    privileged: true            # needed to start the *nested* daemon; the nested
+                                # daemon itself is rootless and host-isolated.
+    environment:
+      DOCKER_TLS_CERTDIR: ""    # internal network only; no published port
+    command: ["--host=tcp://0.0.0.0:2375"]
+    volumes:
+      - sandbox_docker_data:/var/lib/docker
+    # The worker copies its workspace files to a shared volume the daemon can see.
+    # Keep SANDBOX_DOCKER_MOUNT_ROOT pointed at this shared volume in both services.
+
+  worker:
+    # environment here is merged on top of the base worker's environment.
+    environment:
+      # Talk to the isolated daemon instead of the (now-removed) host socket.
+      SANDBOX_DOCKER_HOST: tcp://docker-rootless:2375
+      # Enable a hardened OCI runtime if the rootless daemon has it installed.
+      # Leave empty to use the daemon default. gVisor: runsc, Kata: kata-runtime.
+      SANDBOX_RUNTIME: ${SANDBOX_RUNTIME:-}
+      # Satisfies the production hardening check (config.production_hardening_issues).
+      ROOTLESS_SANDBOX_HOST: "true"
+    depends_on:
+      docker-rootless:
+        condition: service_started
+
+volumes:
+  sandbox_docker_data:
